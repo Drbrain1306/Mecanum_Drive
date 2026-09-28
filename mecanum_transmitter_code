@@ -1,0 +1,204 @@
+// --- CODE IN TURKISH (PROVIDED BY MY PROJECT TEAM COLLEAGUES) ---
+// --- ESP32 KUMANDA (MECANUM PROTOKOL UYUMLU) ---
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h> 
+#include <math.h> 
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);  
+
+// --- ALICI (MOTOR) ESP'NIN MAC ADRESI ---
+uint8_t aliciAddress[] = {0xEC, 0x64, 0xC9, 0x85, 0x7C, 0x84}; 
+#define ESPNOW_WIFI_CHANNEL 1
+
+// --- ALICI ILE BIREBIR AYNI VERI YAPISI (11 Byte) ---
+typedef struct __attribute__((packed)) {
+  int16_t  x_norm;   // Strafe ekseni (-1000 .. +1000)
+  int16_t  y_norm;   // Ileri/Geri ekseni (-1000 .. +1000)
+  int16_t  yaw_norm; // Donus ekseni (-1000 .. +1000)
+  uint8_t  estop;    // 1: Acil Stop, 0: Normal
+  uint32_t seq;      // Paket sira sayaci (Watchdog icin)
+} robot_cmd_t;
+
+robot_cmd_t veriPaketi;
+esp_now_peer_info_t peerInfo;
+
+// --- OK TASARIMLARI ---
+byte okYukari[8] = { B00100, B01110, B10101, B00100, B00100, B00100, B00100, B00000 };
+byte okSagUst[8] = { B01111, B00011, B00101, B01001, B10000, B00000, B00000, B00000 };
+byte okSag[8]    = { B00000, B00100, B00010, B11111, B00010, B00100, B00000, B00000 };
+byte okSagAlt[8] = { B00000, B00000, B10000, B01001, B00101, B00011, B01111, B00000 };
+byte okAsagi[8]  = { B00100, B00100, B00100, B00100, B10101, B01110, B00100, B00000 };
+byte okSolAlt[8] = { B00000, B00000, B00001, B10010, B10100, B11000, B11110, B00000 };
+byte okSol[8]    = { B00000, B00100, B01000, B11111, B01000, B00100, B00000, B00000 };
+byte okSolUst[8] = { B11110, B11000, B10100, B10010, B00001, B00000, B00000, B00000 };
+
+#define PIN_JOY_X 33    
+#define PIN_JOY_Y 34    
+#define PIN_YAW   32     
+#define PIN_BUTON 19    
+
+const int DEADZONE = 180; 
+int merkezX = 2048, merkezY = 2048, merkezYaw = 2048;
+int tutucu = 0;
+uint32_t packet_seq = 0;
+
+void oklariYukle() {
+  lcd.createChar(0, okYukari);
+  lcd.createChar(1, okSagUst);
+  lcd.createChar(2, okSag);
+  lcd.createChar(3, okSagAlt);
+  lcd.createChar(4, okAsagi);
+  lcd.createChar(5, okSolAlt);
+  lcd.createChar(6, okSol);
+  lcd.createChar(7, okSolUst);
+}
+
+int aciToOkIndex(int derece) {
+  if (derece == -1) return -1; 
+  int dilim = (derece + 22) / 45;
+  if (dilim >= 8) dilim = 0; 
+  int oklar[] = {2, 1, 0, 7, 6, 5, 4, 3}; 
+  return oklar[dilim];
+}
+
+void ekraniGuncelle(int aci, float hiz, int yawDeg, int yonIndex) {
+  lcd.setCursor(0, 0);
+  if(yonIndex == -1) lcd.print("."); else lcd.write(yonIndex); 
+  
+  lcd.setCursor(2, 0); 
+  if(aci == -1) {
+    lcd.print("---");
+  } else {
+    if(aci < 100) lcd.print(" ");
+    if(aci < 10) lcd.print(" ");
+    lcd.print(aci);
+  }
+  lcd.print((char)223); 
+  
+  lcd.setCursor(9, 0); 
+  lcd.print(hiz);             
+  lcd.print("m/s");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Yaw:");
+  lcd.setCursor(5, 1);
+  if(abs(yawDeg) < 100) lcd.print(" ");
+  if(abs(yawDeg) < 10) lcd.print(" ");
+  lcd.print(yawDeg);
+  lcd.print("   ");
+}
+
+void setup() {
+  Serial.begin(115200); 
+
+  WiFi.mode(WIFI_STA);
+  // Receiver ile ayni kanali dinlemek sart
+  esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW Baslatilamadi!");
+    return;
+  }
+  
+  memcpy(peerInfo.peer_addr, aliciAddress, 6);
+  peerInfo.channel = ESPNOW_WIFI_CHANNEL;  
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  
+  pinMode(PIN_BUTON, INPUT_PULLUP); 
+  pinMode(PIN_JOY_X, INPUT);
+  pinMode(PIN_JOY_Y, INPUT);
+  pinMode(PIN_YAW, INPUT);
+  
+  lcd.init();      
+  lcd.backlight(); 
+  oklariYukle();
+  
+  // Merkez Kalibrasyonu
+  long tx = 0, ty = 0, tyaw = 0;
+  for(int i=0; i<10; i++) { 
+    tx += analogRead(PIN_JOY_X); 
+    ty += analogRead(PIN_JOY_Y); 
+    tyaw += analogRead(PIN_YAW);
+    delay(10); 
+  }
+  merkezX = tx / 10; 
+  merkezY = ty / 10;
+  merkezYaw = tyaw / 10;
+  
+  lcd.clear();
+}
+
+void loop() {
+  // ACIL STOP BUTONU KONTROLU
+  if(digitalRead(PIN_BUTON) == LOW){ 
+    tutucu = !tutucu;
+    lcd.clear();
+    if(tutucu) {
+      lcd.setCursor(0,0); lcd.print("!! ACIL STOP !!");
+      lcd.setCursor(0,1); lcd.print(" SISTEM DURDU ");
+      
+      veriPaketi.x_norm = 0;
+      veriPaketi.y_norm = 0;
+      veriPaketi.yaw_norm = 0;
+      veriPaketi.estop = 1;
+      veriPaketi.seq = ++packet_seq;
+      esp_now_send(aliciAddress, (uint8_t *) &veriPaketi, sizeof(robot_cmd_t));
+    }
+    delay(300); // Debounce
+  }
+  
+  if(!tutucu){
+    static unsigned long son = 0;
+    if(millis() - son >= 50) { // 20 Hz guncelleme periyodu (watchdog 300ms icin guvenli)
+      son = millis();
+
+      int rawX = analogRead(PIN_JOY_X);
+      int rawY = analogRead(PIN_JOY_Y);
+      int rawYaw = analogRead(PIN_YAW); 
+
+      // Eksen sapmalari
+      int mapX = rawX - merkezX;
+      int mapY = rawY - merkezY;
+      int mapYaw = rawYaw - merkezYaw;
+
+      // Deadzone filtreleme
+      if (abs(mapX) < DEADZONE) mapX = 0;
+      if (abs(mapY) < DEADZONE) mapY = 0;
+      if (abs(mapYaw) < DEADZONE) mapYaw = 0;
+
+      // -1000 .. +1000 araligina normalize etme
+      int16_t normX = constrain((mapX * 1000) / 2048, -1000, 1000);
+      int16_t normY = constrain((mapY * 1000) / 2048, -1000, 1000);
+      int16_t normYaw = constrain((mapYaw * 1000) / 2048, -1000, 1000);
+
+      // LCD Ekran hesaplamalari
+      int hareketAcisi = -1;
+      float hizMs = 0.0;
+      if (normX != 0 || normY != 0) {
+        double radyan = atan2(normY, normX); 
+        hareketAcisi = radyan * 180.0 / M_PI; 
+        if (hareketAcisi < 0) hareketAcisi += 360;
+        float mesafe = sqrt((float)normX * normX + (float)normY * normY);
+        hizMs = (mesafe / 1000.0f) * 0.32f; // Max ~0.32 m/s
+      }
+
+      int yonIndex = aciToOkIndex(hareketAcisi);
+      ekraniGuncelle(hareketAcisi, hizMs, normYaw, yonIndex);
+
+      // Mecanum Receiver'a gonderilecek paket
+      veriPaketi.x_norm = normX;       // Strafe
+      veriPaketi.y_norm = normY;       // Ileri/Geri
+      veriPaketi.yaw_norm = normYaw;   // Donus
+      veriPaketi.estop = 0;
+      veriPaketi.seq = ++packet_seq;
+
+      esp_now_send(aliciAddress, (uint8_t *) &veriPaketi, sizeof(robot_cmd_t));
+    }
+  }
+}
