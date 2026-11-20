@@ -1,3 +1,8 @@
+// =============================================================================
+// MECANUM RECEIVER - 4x BTS7960 (IBT-2), ESP32, ESP-NOW command link
+// With 3-stage software current protection (slew limiter, PWM ceiling, stall
+// detection) per "Mecanum Vehicle Power Management" report.
+// =============================================================================
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -10,42 +15,57 @@
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
-#include "esp_now.h" // ESP-NOW wireless communication
+#include "esp_now.h"
 #include "esp_event.h"
-#include "esp_netif.h" // ESP-NOW wireless communication
-#include "nvs_flash.h" //Non-Volatile Storage (NVS)
+#include "esp_netif.h"
+#include "nvs_flash.h"
 
-static const char *TAG = "MECANUM_DRIVE"; //Def mecanum global name
+static const char *TAG = "MECANUM_DRIVE";
 
 // -------------------------------------------------------------
-// ROBOT GEOMETRIC & PHYSICAL CONSTANTS
+// ROBOT GEOMETRIC & PHYSICAL CONSTANTS (assumed values)
 // -------------------------------------------------------------
-//Note values of the wheels/chasis are all assumed for now
-#define WHEEL_RADIUS_M 0.040f // Wheel radius (m) (assumed 80mm Mecanum)
-#define CHASSIS_LX_M   0.120f // Distance from robot center to front/rear axles (m)
-#define CHASSIS_LY_M   0.140f // Distance from robot center to left/right wheel contact lines (m)
+#define WHEEL_RADIUS_M          0.040f
+#define CHASSIS_LX_M            0.120f
+#define CHASSIS_LY_M            0.140f
+#define MAX_WHEEL_RAD_S         9.0f        // ~82 RPM loaded, with headroom
+#define ENCODER_PPR             1600.0f     // 400 pulses/phase, 4x quadrature
 
-// Motor: 102ZY24-250-A-01 (1:31 gearbox, 82 RPM loaded, 105 RPM no-load)
-// 82 RPM ~ 8.59 rad/s, capped at 9.0 rad/s for velocity headroom normalization
-#define MAX_WHEEL_RAD_S 9.0f
-
-// Encoder: DFRobot SEN0230 (400 pulses/phase -> 1600 counts/rev in 4x quadrature)
-#define ENCODER_PPR 1600.0f
-
-#define CONTROL_LOOP_PERIOD_MS 19   // 100 Hz deterministic control loop rate
-#define PIN_IBT2_ENABLE GPIO_NUM_27 // Shared enable for all IBT-2 drivers
+#define CONTROL_LOOP_PERIOD_MS  10          // 100 Hz deterministic control loop
+#define PIN_IBT2_ENABLE         GPIO_NUM_27 // Shared enable for all IBT-2 drivers
 
 // PWM configuration for IBT-2 (BTS7960) H-bridges
-#define PWM_FREQ_HZ 2000 //20 kHZ ultrasonic switching
-#define PWM_RES_BITS LEDC_TIMER_10_BIT
-#define PWM_MAX_DUTY ((1 << 10) - 1) // value 1023
+#define PWM_FREQ_HZ             20000       // 20 kHz
+#define PWM_RES_BITS            LEDC_TIMER_10_BIT
+#define PWM_MAX_DUTY            ((1 << 10) - 1) // 1023
 
-// Command link / Watchdog timeout
-#define COMM_TIMEOUT_MS     300 // Failsafe triggers if no new packet arrives in 300ms
-#define ESPNOW_WIFI_CHANNEL 1 // Must match transmitter channel exactly
+// -------------------------------------------------------------
+// SOFTWARE CURRENT PROTECTION CONSTANTS
+// -------------------------------------------------------------
+// Stage B: PWM duty ceiling (~55% -> 140/255) to protect 30A BMS and 14 AWG line
+#define MAX_EFFORT_LIMIT        0.55f
 
-// M.D enum format type
-typedef enum{
+// Stage A: Slew rate limiter. 0.012 per 10 ms tick = ~3 PWM units (of 255)
+// per tick, so 0 -> 0.55 takes ~460 ms. Use 0.008f for a ~0.7 s ramp.
+#define SLEW_RATE_MAX_DELTA     0.012f
+
+// Stage C: Stall protection
+#define STALL_EFFORT_THRESHOLD  0.20f       // ~50/255 effort
+#define STALL_VEL_THRESHOLD_RAD 0.15f       // "zero" speed (1 count/tick = ~0.39 rad/s)
+#define STALL_TIMEOUT_MS        500         // continuous time before tripping
+
+// Repeated-fault lockout: this many stall trips inside the window require a
+// power cycle (prevents repeatedly driving the robot into a jam).
+#define STALL_MAX_TRIPS         3
+#define STALL_TRIP_WINDOW_MS    60000
+
+// Misc
+#define PID_INTEGRAL_LIMIT      5.0f
+#define JOY_DEADBAND            0.05f
+#define COMM_TIMEOUT_MS         300
+#define ESPNOW_WIFI_CHANNEL     1             // Must match transmitter channel
+
+typedef enum {
   WHEEL_M1_FL = 0,
   WHEEL_M2_FR = 1,
   WHEEL_M3_BL = 2,
@@ -53,8 +73,7 @@ typedef enum{
   WHEEL_COUNT = 4
 } wheel_id_t;
 
-// r/l pwm and encoder struct format type
-typedef struct{
+typedef struct {
   gpio_num_t r_pwm_pin;
   gpio_num_t l_pwm_pin;
   ledc_channel_t r_pwm_chan;
@@ -65,224 +84,177 @@ typedef struct{
   bool invert_encoder;
 } motor_hw_config_t;
 
-// -----------------------------------------------------------------------------
-// SCHEMATIC PINOUT / HARDWARE PERIPHERAL MAPPING
-// -----------------------------------------------------------------------------
+// Positional initializers in wheel_id_t order (portable between C and C++).
+// Field order: r_pwm_pin, l_pwm_pin, r_chan, l_chan, enc_a, enc_b, inv_motor, inv_enc
 static const motor_hw_config_t HW_CONFIG[WHEEL_COUNT] = {
-  [WHEEL_M1_FL] = {
-    .r_pwm_pin = GPIO_NUM_32,
-    .l_pwm_pin = GPIO_NUM_33,
-    .r_pwm_chan = LEDC_CHANNEL_0,
-    .l_pwm_chan = LEDC_CHANNEL_1,
-    .enc_a_pin = GPIO_NUM_34,
-    .enc_b_pin = GPIO_NUM_35,
-    .invert_motor = false,
-    .invert_encoder = false
-  },
-  [WHEEL_M2_FR] = {
-    .r_pwm_pin = GPIO_NUM_25,
-    .l_pwm_pin = GPIO_NUM_26,
-    .r_pwm_chan = LEDC_CHANNEL_2,
-    .l_pwm_chan = LEDC_CHANNEL_3,
-    .enc_a_pin = GPIO_NUM_36, // SENSOR_VP, ext pull-up res required
-    .enc_b_pin = GPIO_NUM_39, // SENSOR_VN, ext pull-up res required
-    .invert_motor = true, // Mirrored right side
-    .invert_encoder = true
-  },
-  [WHEEL_M3_BL] = {
-    .r_pwm_pin = GPIO_NUM_18,
-    .l_pwm_pin = GPIO_NUM_19,
-    .r_pwm_chan = LEDC_CHANNEL_4,
-    .l_pwm_chan = LEDC_CHANNEL_5,
-    .enc_a_pin = GPIO_NUM_14, 
-    .enc_b_pin = GPIO_NUM_13, 
-    .invert_motor = false,
-    .invert_encoder = false
-  },
-  [WHEEL_M4_BR] = {
-    .r_pwm_pin = GPIO_NUM_23,
-    .l_pwm_pin = GPIO_NUM_17, // TX2 in schematic (Warning: Do NOT use with PSRAM/WROVER)
-    .r_pwm_chan = LEDC_CHANNEL_6,
-    .l_pwm_chan = LEDC_CHANNEL_7,
-    .enc_a_pin = GPIO_NUM_16, // RX2 in schematic (Warning: Do NOT use with PSRAM/WROVER)
-    .enc_b_pin = GPIO_NUM_4, // D4 in schematic
-    .invert_motor = true, // Mirrored right side
-    .invert_encoder = true
-  },
+  // M1 front-left
+  { GPIO_NUM_32, GPIO_NUM_33, LEDC_CHANNEL_0, LEDC_CHANNEL_1, GPIO_NUM_34, GPIO_NUM_35, false, false },
+  // M2 front-right (mirrored). GPIO36/39 are input-only, ext pull-ups required
+  { GPIO_NUM_25, GPIO_NUM_26, LEDC_CHANNEL_2, LEDC_CHANNEL_3, GPIO_NUM_36, GPIO_NUM_39, true,  true  },
+  // M3 back-left
+  { GPIO_NUM_18, GPIO_NUM_19, LEDC_CHANNEL_4, LEDC_CHANNEL_5, GPIO_NUM_14, GPIO_NUM_13, false, false },
+  // M4 back-right (mirrored). GPIO16/17 conflict with PSRAM on WROVER modules
+  { GPIO_NUM_23, GPIO_NUM_17, LEDC_CHANNEL_6, LEDC_CHANNEL_7, GPIO_NUM_16, GPIO_NUM_4,  true,  true  },
 };
 
-// Struct typedef for chasis velocity
-typedef struct{
-  float vx; // Forward velocity (m/s)
-  float vy; // Leftward velocity (m/s)
-  float wz; // CCW angular velocity (rad/s)
+typedef struct {
+  float vx;   // forward (m/s)
+  float vy;   // leftward (m/s)
+  float wz;   // CCW (rad/s)
 } chassis_twist_t;
 
-// Struct typedef for control and pid integral/error management 
-typedef struct{
-  float target_rad_s[WHEEL_COUNT];
-  float meas_rad_s[WHEEL_COUNT];
-  float pid_integral[WHEEL_COUNT];
-  float pid_prev_error[WHEEL_COUNT]; // Range: [-1.0, 1.0]
-  float control_effort[WHEEL_COUNT];
+typedef struct {
+  float    target_rad_s[WHEEL_COUNT];
+  float    meas_rad_s[WHEEL_COUNT];
+  float    pid_integral[WHEEL_COUNT];
+  float    ramped_effort[WHEEL_COUNT];   // actual slewed output
+  uint32_t stall_timer_ms[WHEEL_COUNT];
+
+  bool     system_stalled;               // latched fault
+  bool     stall_lockout;                // too many trips -> power cycle required
+  bool     reset_armed;                  // operator pressed e-stop during fault
+  uint8_t  recent_trips;
+  uint32_t last_trip_ms;
 } drivetrain_state_t;
 
-// Struct typedef for pid gains
-typedef struct{
+typedef struct {
   float kp;
   float ki;
   float kd;
   float kff;
 } pid_gains_t;
 
-// Tuned feedforward and feedback gains for 250W 1:31 geared high-torque DC motors
-// NOTE: Kd is kept at 0 to avoid derivative chatter from discrete pulse quantization
 static const pid_gains_t PID_GAINS = {
-  .kp = 0.120f, // current error, Kp ↑ → stronger response to speed error
-  .ki = 0.025f, // Ki → reacts to accumulated error
-  .kd = 0.000f, // kd → reacts to how quickly the error is changing
-  .kff = 0.105f // Baseline voltage estimation ~ (1.0 / MAX_WHEEL_RAD_S)
+  0.120f,   // kp
+  0.025f,   // ki
+  0.000f,   // kd (0: avoids derivative chatter from pulse quantization)
+  0.105f    // kff (~1.0 / MAX_WHEEL_RAD_S)
 };
 
-// Pulse counter (pcnt)
 static pcnt_unit_handle_t pcnt_units[WHEEL_COUNT];
 
-// -----------------------------------------------------------------------------
-// WIRE PROTOCOL (Exact 11-byte match to Transmitter robot_cmd_t)
-// -----------------------------------------------------------------------------
-typedef struct __attribute__((packed)){
-  int16_t x_norm; // Strafe axis (-1000 to +1000)
-  int16_t y_norm; // Forward axis (-1000 to +1000)
-  int16_t yaw_norm; // Rotation axis (-1000 to +1000)
-  uint8_t estop; // 1 = Emergency Stop, 0 = Normal
-  uint32_t seq; // Monotonically increasing packet counter
+// -------------------------------------------------------------
+// WIRE PROTOCOL (11 bytes, must match transmitter robot_cmd_t)
+// -------------------------------------------------------------
+typedef struct __attribute__((packed)) {
+  int16_t  x_norm;     // strafe  (-1000..+1000)
+  int16_t  y_norm;     // forward (-1000..+1000)
+  int16_t  yaw_norm;   // rotation(-1000..+1000)
+  uint8_t  estop;      // 1 = emergency stop
+  uint32_t seq;        // packet counter
 } robot_cmd_t;
 
 static QueueHandle_t s_cmd_queue = NULL;
 
-// Receive Call back function 
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len){
-  if (len != sizeof(robot_cmd_t)){
+static inline float clampf(float v, float lo, float hi) {
+  return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
+  if (len != (int)sizeof(robot_cmd_t)) {
     ESP_LOGW(TAG, "Dropped packet: bad size %d (expected %d)", len, (int)sizeof(robot_cmd_t));
     return;
   }
-
   robot_cmd_t cmd;
   memcpy(&cmd, data, sizeof(cmd));
   xQueueOverwrite(s_cmd_queue, &cmd);
 }
 
-// Initialize espnow communi btw commander and receiver
-static void init_espnow(void){
+static void init_espnow(void) {
   esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND){
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ret = nvs_flash_init();
   }
   ESP_ERROR_CHECK(ret);
 
   ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  // Tolerate "already created" when running under the Arduino core
+  esp_err_t ev = esp_event_loop_create_default();
+  if (ev != ESP_OK && ev != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(ev);
 
   wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // Disable power saving for consistent latency
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   // consistent latency
   ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
   s_cmd_queue = xQueueCreate(1, sizeof(robot_cmd_t));
-  if(s_cmd_queue == NULL){
+  if (s_cmd_queue == NULL) {
     ESP_LOGE(TAG, "Failed to create ESP-NOW queue");
   }
-
   ESP_ERROR_CHECK(esp_now_init());
   ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
-
   ESP_LOGI(TAG, "ESP-NOW receiver active on Wi-Fi channel %d", ESPNOW_WIFI_CHANNEL);
 }
 
-// -----------------------------------------------------------------------------
-// HARDWARE INITIALIZATION
-// -----------------------------------------------------------------------------
-static void init_ibt2_pwm_and_enables(void){
-  ledc_timer_config_t time_conf = {
-    .speed_mode = LEDC_LOW_SPEED_MODE,
-    .duty_resolution = PWM_RES_BITS,
-    .timer_num = LEDC_TIMER_0,
-    .freq_hz = PWM_FREQ_HZ,
-    .clk_cfg = LEDC_AUTO_CLK
-  };
-  ESP_ERROR_CHECK(ledc_timer_config(&time_conf)); // Checks for error in set timer configs
+static void init_ibt2_pwm_and_enables(void) {
+  ledc_timer_config_t timer_conf = {};
+  timer_conf.speed_mode      = LEDC_LOW_SPEED_MODE;
+  timer_conf.duty_resolution = PWM_RES_BITS;
+  timer_conf.timer_num       = LEDC_TIMER_0;
+  timer_conf.freq_hz         = PWM_FREQ_HZ;
+  timer_conf.clk_cfg         = LEDC_AUTO_CLK;
+  ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
 
-  for(int i = 0; i < WHEEL_COUNT; i++){
-    // Configure R_PWM LEDC channel
-    ledc_channel_config_t chan_r = {
-      .gpio_num = HW_CONFIG[i].r_pwm_pin,
-      .speed_mode = LEDC_LOW_SPEED_MODE,
-      .channel = HW_CONFIG[i].r_pwm_chan,
-      .intr_type = LEDC_INTR_DISABLE,
-      .timer_sel = LEDC_TIMER_0,
-      .duty = 0,
-      .hpoint = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&chan_r)); // Checks for error in channel settings of chan_r config
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    ledc_channel_config_t chan_r = {};
+    chan_r.gpio_num   = HW_CONFIG[i].r_pwm_pin;
+    chan_r.speed_mode = LEDC_LOW_SPEED_MODE;
+    chan_r.channel    = HW_CONFIG[i].r_pwm_chan;
+    chan_r.intr_type  = LEDC_INTR_DISABLE;
+    chan_r.timer_sel  = LEDC_TIMER_0;
+    chan_r.duty       = 0;
+    chan_r.hpoint     = 0;
+    ESP_ERROR_CHECK(ledc_channel_config(&chan_r));
 
-    // Configure L_PWM LEDC channel
-    ledc_channel_config_t chan_l = {
-      .gpio_num = HW_CONFIG[i].l_pwm_pin,
-      .speed_mode = LEDC_LOW_SPEED_MODE,
-      .channel = HW_CONFIG[i].l_pwm_chan,
-      .intr_type = LEDC_INTR_DISABLE,
-      .timer_sel = LEDC_TIMER_0,
-      .duty = 0,
-      .hpoint = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&chan_l)); // Checks for error in channel settings of chan_l config
+    ledc_channel_config_t chan_l = {};
+    chan_l.gpio_num   = HW_CONFIG[i].l_pwm_pin;
+    chan_l.speed_mode = LEDC_LOW_SPEED_MODE;
+    chan_l.channel    = HW_CONFIG[i].l_pwm_chan;
+    chan_l.intr_type  = LEDC_INTR_DISABLE;
+    chan_l.timer_sel  = LEDC_TIMER_0;
+    chan_l.duty       = 0;
+    chan_l.hpoint     = 0;
+    ESP_ERROR_CHECK(ledc_channel_config(&chan_l));
   }
 
-  // Configure IBT-2 Enable Pin (GPIO 27)
-  gpio_config_t en_conf = {
-    .pin_bit_mask = (1ULL << PIN_IBT2_ENABLE),
-    .mode = GPIO_MODE_OUTPUT,
-    .pull_up_en = GPIO_PULLUP_DISABLE,
-    .pull_down_en = GPIO_PULLDOWN_DISABLE,
-    .intr_type = GPIO_INTR_DISABLE
-  };
+  gpio_config_t en_conf = {};
+  en_conf.pin_bit_mask = (1ULL << PIN_IBT2_ENABLE);
+  en_conf.mode         = GPIO_MODE_OUTPUT;
+  en_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
+  en_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  en_conf.intr_type    = GPIO_INTR_DISABLE;
   ESP_ERROR_CHECK(gpio_config(&en_conf));
-  gpio_set_level(PIN_IBT2_ENABLE, 1); // Enable BTS7960 bridges
+  gpio_set_level(PIN_IBT2_ENABLE, 1);   // enable BTS7960 bridges
 }
 
 static void init_pcnt_encoders(void) {
-  pcnt_unit_config_t unit_config = {
-    .low_limit = -32768,
-    .high_limit = 32767
-  };
-    for(int i = 0; i < WHEEL_COUNT; i++){
+  pcnt_unit_config_t unit_config = {};
+  unit_config.low_limit  = -32768;
+  unit_config.high_limit = 32767;
+
+  for (int i = 0; i < WHEEL_COUNT; i++) {
     ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_units[i]));
 
-    // Glitch filter: suppresses spikes shorter than 1000 ns
-    pcnt_glitch_filter_config_t filter_config = {
-      .max_glitch_ns = 1000,
-    };
+    pcnt_glitch_filter_config_t filter_config = {};
+    filter_config.max_glitch_ns = 1000;
     ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(pcnt_units[i], &filter_config));
 
-    // 4x Quadrature Decoding: Phase A edge, Phase B level
-    pcnt_chan_config_t chan_a_config = {
-      .edge_gpio_num = HW_CONFIG[i].enc_a_pin,
-      .level_gpio_num= HW_CONFIG[i].enc_b_pin
-    };
+    // 4x quadrature decoding: phase A edge / phase B level, then the reverse
+    pcnt_chan_config_t chan_a_config = {};
+    chan_a_config.edge_gpio_num  = HW_CONFIG[i].enc_a_pin;
+    chan_a_config.level_gpio_num = HW_CONFIG[i].enc_b_pin;
     pcnt_channel_handle_t chan_a = NULL;
     ESP_ERROR_CHECK(pcnt_new_channel(pcnt_units[i], &chan_a_config, &chan_a));
     ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_a, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE));
     ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 
-    // 4x Quadrature Decoding: Phase B edge, Phase A level
-    pcnt_chan_config_t chan_b_config = {
-        .edge_gpio_num  = HW_CONFIG[i].enc_b_pin,
-        .level_gpio_num = HW_CONFIG[i].enc_a_pin,
-    };
+    pcnt_chan_config_t chan_b_config = {};
+    chan_b_config.edge_gpio_num  = HW_CONFIG[i].enc_b_pin;
+    chan_b_config.level_gpio_num = HW_CONFIG[i].enc_a_pin;
     pcnt_channel_handle_t chan_b = NULL;
     ESP_ERROR_CHECK(pcnt_new_channel(pcnt_units[i], &chan_b_config, &chan_b));
     ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_b, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE));
@@ -294,54 +266,40 @@ static void init_pcnt_encoders(void) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// CONTROL PIPELINE
-// -----------------------------------------------------------------------------
-static chassis_twist_t condition_inputs(float raw_x, float raw_y, float raw_yaw){
+// -------------------------------------------------------------
+// INPUT CONDITIONING / KINEMATICS / ENCODER FEEDBACK
+// -------------------------------------------------------------
+static chassis_twist_t condition_inputs(float raw_x, float raw_y, float raw_yaw) {
   chassis_twist_t cmd;
-  const float deadband = 0.05f; //ignore very small joystick/controller inputs
 
-  float x   = (fabsf(raw_x)   < deadband) ? 0.0f : raw_x;
-  float y   = (fabsf(raw_y)   < deadband) ? 0.0f : raw_y;
-  float yaw = (fabsf(raw_yaw) < deadband) ? 0.0f : raw_yaw;
+  float x   = (fabsf(raw_x)   < JOY_DEADBAND) ? 0.0f : raw_x;
+  float y   = (fabsf(raw_y)   < JOY_DEADBAND) ? 0.0f : raw_y;
+  float yaw = (fabsf(raw_yaw) < JOY_DEADBAND) ? 0.0f : raw_yaw;
 
-  //These define how aggressively the robot responds to the controller
-  // Map normalized inputs [-1.0, 1.0] to physical robot velocities
-  // Forward / Backward along X-axis
   cmd.vx = y * 0.32f;
-  // Strafe Left / Right along Y-axis (Inverted to follow standard ROS REP-103 frame)
   cmd.vy = -x * 0.32f;
-  // Angular rotation rate (rad/s)
   cmd.wz = -yaw * 1.20f;
-
   return cmd;
 }
 
-// Computing the standard Mecanum Inverse Kinematics
 static void compute_inverse_kinematics(const chassis_twist_t *cmd, float out_targets[WHEEL_COUNT]) {
   const float k_geom = CHASSIS_LX_M + CHASSIS_LY_M;
   const float inv_r  = 1.0f / WHEEL_RADIUS_M;
 
-  // Standard Mecanum Inverse Kinematics (O-shape roller footprint)
   out_targets[WHEEL_M1_FL] = inv_r * (cmd->vx - cmd->vy - (k_geom * cmd->wz));
   out_targets[WHEEL_M2_FR] = inv_r * (cmd->vx + cmd->vy + (k_geom * cmd->wz));
   out_targets[WHEEL_M3_BL] = inv_r * (cmd->vx + cmd->vy - (k_geom * cmd->wz));
   out_targets[WHEEL_M4_BR] = inv_r * (cmd->vx - cmd->vy + (k_geom * cmd->wz));
 
-  // Vector headroom scaling: Preserves directional trajectory when any motor saturates
+  // Headroom scaling: preserves direction when any wheel saturates
   float max_speed = 0.0f;
   for (int i = 0; i < WHEEL_COUNT; i++) {
     float spd = fabsf(out_targets[i]);
-    if (spd > max_speed) {
-        max_speed = spd;
-    }  
+    if (spd > max_speed) max_speed = spd;
   }
-
-  if(max_speed > MAX_WHEEL_RAD_S) {
+  if (max_speed > MAX_WHEEL_RAD_S) {
     float scalar = MAX_WHEEL_RAD_S / max_speed;
-    for(int i = 0;  i < WHEEL_COUNT; i++){
-      out_targets[i] *= scalar;
-    }
+    for (int i = 0; i < WHEEL_COUNT; i++) out_targets[i] *= scalar;
   }
 }
 
@@ -351,58 +309,173 @@ static void sample_encoder_feedback(drivetrain_state_t *state, float dt) {
     pcnt_unit_get_count(pcnt_units[i], &pulse_count);
     pcnt_unit_clear_count(pcnt_units[i]);
 
-    if (HW_CONFIG[i].invert_encoder) {
-        pulse_count = -pulse_count;
-    }
+    if (HW_CONFIG[i].invert_encoder) pulse_count = -pulse_count;
 
     float revs = (float)pulse_count / ENCODER_PPR;
     state->meas_rad_s[i] = (revs * 2.0f * (float)M_PI) / dt;
   }
 }
 
-static void compute_wheel_pid(drivetrain_state_t *state, float dt) {
+// -------------------------------------------------------------
+// OUTPUT HELPERS
+// -------------------------------------------------------------
+static void write_pwm_zero_all(void) {
   for (int i = 0; i < WHEEL_COUNT; i++) {
-    float error = state->target_rad_s[i] - state->meas_rad_s[i];
-
-      // Anti-windup integration clamp
-    state->pid_integral[i] += error * dt;
-    if (state->pid_integral[i] > 10.0f)  state->pid_integral[i] = 10.0f;
-    if (state->pid_integral[i] < -10.0f) state->pid_integral[i] = -10.0f;
-
-    float effort = (PID_GAINS.kff * state->target_rad_s[i]) +
-                   (PID_GAINS.kp  * error) +
-                   (PID_GAINS.ki  * state->pid_integral[i]);
-
-    // Output clamping to normalized range [-1.0, 1.0]
-    if (effort > 1.0f)  effort = 1.0f;
-    if (effort < -1.0f) effort = -1.0f;
-
-    state->control_effort[i] = effort;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, 0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan);
   }
 }
 
-static void apply_actuation_ibt2(const drivetrain_state_t *state) {
+// Fault state: all PWM to 0 AND drivers disabled in hardware via D27.
+// Idempotent, so it is safe to call every tick while faulted.
+static void fault_shutdown(drivetrain_state_t *s) {
+  gpio_set_level(PIN_IBT2_ENABLE, 0);
+  write_pwm_zero_all();
   for (int i = 0; i < WHEEL_COUNT; i++) {
-    float effort = state->control_effort[i];
+    s->ramped_effort[i]  = 0.0f;
+    s->pid_integral[i]   = 0.0f;
+    s->stall_timer_ms[i] = 0;
+  }
+}
 
-    if (HW_CONFIG[i].invert_motor) {
-        effort = -effort;
+// E-stop: bypass the slew limiter and cut PWM immediately. Drivers stay enabled
+// (both inputs low = low-side braking), so the wheels stop hard.
+static void hard_stop_outputs(drivetrain_state_t *s) {
+  write_pwm_zero_all();
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    s->ramped_effort[i]  = 0.0f;
+    s->pid_integral[i]   = 0.0f;
+    s->stall_timer_ms[i] = 0;
+  }
+}
+
+static void register_stall_trip(drivetrain_state_t *s, int wheel) {
+  uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+  if (s->recent_trips > 0 && (now_ms - s->last_trip_ms) < STALL_TRIP_WINDOW_MS) {
+    s->recent_trips++;
+  } else {
+    s->recent_trips = 1;
+  }
+  s->last_trip_ms   = now_ms;
+  s->system_stalled = true;
+  s->reset_armed    = false;
+
+  ESP_LOGE(TAG, "EMERGENCY: stall on wheel %d, drivers disabled (trip %u/%d)",
+           wheel, (unsigned)s->recent_trips, STALL_MAX_TRIPS);
+
+  if (s->recent_trips >= STALL_MAX_TRIPS) {
+    s->stall_lockout = true;
+    ESP_LOGE(TAG, "Repeated stalls: lockout active, power cycle required");
+  }
+
+  fault_shutdown(s);   // act in the same tick, no partial wheel updates
+}
+
+// Fault reset: operator asserts e-stop, then releases it with the stick
+// neutral and a fresh link. Never resets while locked out.
+static void try_fault_reset(drivetrain_state_t *s, bool comm_fresh, bool estop, bool stick_neutral) {
+  if (s->stall_lockout) return;
+
+  if (!comm_fresh) {
+    s->reset_armed = false;
+    return;
+  }
+  if (estop) {
+    s->reset_armed = true;
+    return;
+  }
+  if (s->reset_armed && stick_neutral) {
+    s->system_stalled = false;
+    s->reset_armed    = false;
+    for (int i = 0; i < WHEEL_COUNT; i++) {
+      s->stall_timer_ms[i] = 0;
+      s->ramped_effort[i]  = 0.0f;
+      s->pid_integral[i]   = 0.0f;
     }
+    gpio_set_level(PIN_IBT2_ENABLE, 1);   // re-enable drivers
+    ESP_LOGI(TAG, "Fault cleared by operator reset");
+  }
+}
+
+// -------------------------------------------------------------
+// CONTROL PIPELINE: PID -> Stage B (ceiling) -> Stage A (slew) -> Stage C (stall)
+// -------------------------------------------------------------
+static void process_protective_control_pipeline(drivetrain_state_t *state, float dt) {
+  if (state->system_stalled) {
+    fault_shutdown(state);
+    return;
+  }
+
+  // Pass 1: compute efforts and run stall detection for ALL wheels first, so a
+  // trip never leaves some wheels updated and others not.
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    float error = state->target_rad_s[i] - state->meas_rad_s[i];
+    float p_ff  = (PID_GAINS.kff * state->target_rad_s[i]) + (PID_GAINS.kp * error);
+
+    // ---- Conditional-integration anti-windup ----
+    // Do not integrate further into the ceiling or into the slew limit;
+    // integrating back out of them is always allowed.
+    float cand    = clampf(state->pid_integral[i] + error * dt, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+    float pre     = p_ff + PID_GAINS.ki * cand;
+    float pre_clm = clampf(pre, -MAX_EFFORT_LIMIT, MAX_EFFORT_LIMIT);
+    float gap     = pre_clm - state->ramped_effort[i];
+
+    bool sat_hi  = pre >  MAX_EFFORT_LIMIT;
+    bool sat_lo  = pre < -MAX_EFFORT_LIMIT;
+    bool slew_up = gap >  SLEW_RATE_MAX_DELTA;
+    bool slew_dn = gap < -SLEW_RATE_MAX_DELTA;
+
+    bool block = (sat_hi  && error > 0.0f) || (sat_lo && error < 0.0f) ||
+                 (slew_up && error > 0.0f) || (slew_dn && error < 0.0f);
+    if (!block) state->pid_integral[i] = cand;
+
+    float raw_effort = p_ff + PID_GAINS.ki * state->pid_integral[i];
+
+    // ---- STAGE B: maximum PWM ceiling ----
+    raw_effort = clampf(raw_effort, -MAX_EFFORT_LIMIT, MAX_EFFORT_LIMIT);
+
+    // ---- STAGE A: slew rate limiter (soft start / ramp through zero) ----
+    float delta = raw_effort - state->ramped_effort[i];
+    if (delta > SLEW_RATE_MAX_DELTA) {
+      state->ramped_effort[i] += SLEW_RATE_MAX_DELTA;
+    } else if (delta < -SLEW_RATE_MAX_DELTA) {
+      state->ramped_effort[i] -= SLEW_RATE_MAX_DELTA;
+    } else {
+      state->ramped_effort[i] = raw_effort;
+    }
+
+    // ---- STAGE C: encoder-based stall protection ----
+    if (fabsf(state->ramped_effort[i]) > STALL_EFFORT_THRESHOLD &&
+        fabsf(state->meas_rad_s[i])    < STALL_VEL_THRESHOLD_RAD) {
+      state->stall_timer_ms[i] += CONTROL_LOOP_PERIOD_MS;
+      if (state->stall_timer_ms[i] >= STALL_TIMEOUT_MS) {
+        register_stall_trip(state, i);   // zeroes PWM, D27 LOW, same tick
+        return;
+      }
+    } else {
+      state->stall_timer_ms[i] = 0;
+    }
+  }
+
+  // Pass 2: actuate BTS7960 (only reached if no stall tripped)
+  for (int i = 0; i < WHEEL_COUNT; i++) {
+    float effort = state->ramped_effort[i];
+    if (HW_CONFIG[i].invert_motor) effort = -effort;
 
     uint32_t duty = (uint32_t)(fabsf(effort) * (float)PWM_MAX_DUTY);
 
     if (effort > 0.01f) {
-        // Forward: drive R_PWM, silence L_PWM
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, duty);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, 0);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, duty);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, 0);
     } else if (effort < -0.01f) {
-        // Reverse: drive L_PWM, silence R_PWM
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, 0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, duty);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, 0);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, duty);
     } else {
-        // Active electrical braking (both low side engaged)
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, 0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, 0);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan, 0);
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].l_pwm_chan, 0);
     }
 
     ledc_update_duty(LEDC_LOW_SPEED_MODE, HW_CONFIG[i].r_pwm_chan);
@@ -410,24 +483,24 @@ static void apply_actuation_ibt2(const drivetrain_state_t *state) {
   }
 }
 
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------
 // DETERMINISTIC 100 HZ CONTROL TASK
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------
 static void mecanum_control_task(void *pvParameters) {
   TickType_t last_wake_time = xTaskGetTickCount();
   const TickType_t period_ticks = pdMS_TO_TICKS(CONTROL_LOOP_PERIOD_MS);
   const float dt = (float)CONTROL_LOOP_PERIOD_MS / 1000.0f;
 
-  drivetrain_state_t drive_state = {0};
-  robot_cmd_t local_cmd = {0};
+  drivetrain_state_t drive_state = {};
+  robot_cmd_t local_cmd = {};
   uint32_t last_seen_seq = 0;
   TickType_t last_rx_tick = xTaskGetTickCount();
   bool packet_ever_received = false;
 
-  ESP_LOGI(TAG, "Mecanum 100 Hz closed-loop control running");
+  ESP_LOGI(TAG, "Mecanum 100 Hz closed-loop control running with software current protection");
 
   for (;;) {
-    // Read latest command from ESP-NOW receiver callback
+    // Latest command from the ESP-NOW callback
     if (xQueueReceive(s_cmd_queue, &local_cmd, 0) == pdTRUE) {
       packet_ever_received = true;
       if (local_cmd.seq != last_seen_seq) {
@@ -436,48 +509,62 @@ static void mecanum_control_task(void *pvParameters) {
       }
     }
 
-    // Failsafe & Staleness Watchdog
+    // Link watchdog and e-stop
     TickType_t elapsed_ticks = xTaskGetTickCount() - last_rx_tick;
     bool comm_stale = (!packet_ever_received) || (elapsed_ticks > pdMS_TO_TICKS(COMM_TIMEOUT_MS));
-    bool failsafe_active = comm_stale || (local_cmd.estop != 0);
+    bool estop      = (local_cmd.estop != 0);
 
     float joy_x = 0.0f, joy_y = 0.0f, joy_yaw = 0.0f;
 
-    if (failsafe_active) {
-
-      // Immediate integral flush to prevent torque jerking when link reconnects
-      for (int i = 0; i < WHEEL_COUNT; i++) {
-        drive_state.pid_integral[i] = 0.0f;
-      }
+    if (comm_stale || estop) {
+      // Flush integrals so nothing jerks when the link returns
+      for (int i = 0; i < WHEEL_COUNT; i++) drive_state.pid_integral[i] = 0.0f;
     } else {
-        joy_x   = (float)local_cmd.x_norm   / 1000.0f;
-        joy_y   = (float)local_cmd.y_norm   / 1000.0f;
-        joy_yaw = (float)local_cmd.yaw_norm / 1000.0f;
-      }
+      joy_x   = (float)local_cmd.x_norm   / 1000.0f;
+      joy_y   = (float)local_cmd.y_norm   / 1000.0f;
+      joy_yaw = (float)local_cmd.yaw_norm / 1000.0f;
+    }
 
     chassis_twist_t cmd = condition_inputs(joy_x, joy_y, joy_yaw);
 
-    compute_inverse_kinematics(&cmd, drive_state.target_rad_s);
+    // Always sample so the PCNT counters never accumulate while idle/faulted
     sample_encoder_feedback(&drive_state, dt);
-    compute_wheel_pid(&drive_state, dt);
-    apply_actuation_ibt2(&drive_state);
+
+    // Fault recovery check (operator e-stop, then release with stick neutral)
+    if (drive_state.system_stalled) {
+      bool stick_neutral = (cmd.vx == 0.0f && cmd.vy == 0.0f && cmd.wz == 0.0f);
+      try_fault_reset(&drive_state, !comm_stale, estop, stick_neutral);
+    }
+
+    if (drive_state.system_stalled) {
+      fault_shutdown(&drive_state);            // keep safe state asserted
+    } else if (estop) {
+      hard_stop_outputs(&drive_state);         // immediate, no ramp
+    } else {
+      // Link loss (comm_stale) uses zero targets and the normal soft ramp-down
+      compute_inverse_kinematics(&cmd, drive_state.target_rad_s);
+      process_protective_control_pipeline(&drive_state, dt);
+    }
 
     vTaskDelayUntil(&last_wake_time, period_ticks);
-    }
+  }
 }
 
-void setup(void) {
-  ESP_LOGI(TAG, "Initializing Mecanum Controller System...");
+// -------------------------------------------------------------
+// STARTUP
+// -------------------------------------------------------------
+static void mecanum_start(void) {
+  ESP_LOGI(TAG, "Booting protected mecanum firmware...");
 
   init_espnow();
   init_ibt2_pwm_and_enables();
   init_pcnt_encoders();
 
-  // Pin high-priority control task to Core 1 (leaving Core 0 for Wi-Fi / ESP-NOW stacks)
+  // Control task on Core 1 (Core 0 is left to the Wi-Fi / ESP-NOW stack)
   xTaskCreatePinnedToCore(
     mecanum_control_task,
     "mecanum_ctrl",
-    4096,
+    6144,
     NULL,
     configMAX_PRIORITIES - 2,
     NULL,
@@ -485,5 +572,16 @@ void setup(void) {
   );
 }
 
-void loop(void) {
+#if defined(ARDUINO)
+void setup(void) {
+  mecanum_start();
 }
+
+void loop(void) {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
+#else
+extern "C" void app_main(void) {
+  mecanum_start();
+}
+#endif
